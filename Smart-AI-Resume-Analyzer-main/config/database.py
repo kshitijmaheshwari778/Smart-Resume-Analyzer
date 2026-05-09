@@ -1,0 +1,432 @@
+"""
+Database module - MongoDB Atlas connection and operations
+"""
+from pymongo import MongoClient, ASCENDING, DESCENDING
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+import os
+import hashlib
+from bson.objectid import ObjectId
+
+load_dotenv()
+
+MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
+MONGODB_DB_NAME = os.getenv('MONGODB_DB_NAME', 'smart_resume')
+
+_client = None
+_db = None
+
+
+def get_database_connection():
+    """Create and return a MongoDB database connection"""
+    global _client, _db
+    if _client is None:
+        _client = MongoClient(MONGODB_URI)
+        _db = _client[MONGODB_DB_NAME]
+    return _db
+
+
+def init_database():
+    """Initialize database collections and indexes"""
+    db = get_database_connection()
+    db.resume_data.create_index([("email", ASCENDING)])
+    db.resume_data.create_index([("created_at", DESCENDING)])
+    db.resume_analysis.create_index([("resume_id", ASCENDING)])
+    db.resume_skills.create_index([("resume_id", ASCENDING)])
+    db.admin.create_index([("email", ASCENDING)], unique=True)
+    db.admin_logs.create_index([("timestamp", DESCENDING)])
+    db.ai_analysis.create_index([("resume_id", ASCENDING)])
+    db.ai_analysis.create_index([("created_at", DESCENDING)])
+
+
+def save_resume_data(data):
+    """Save resume data to database"""
+    db = get_database_connection()
+    try:
+        personal_info = data.get('personal_info', {})
+        document = {
+            'name': personal_info.get('full_name', ''),
+            'email': personal_info.get('email', ''),
+            'phone': personal_info.get('phone', ''),
+            'linkedin': personal_info.get('linkedin', ''),
+            'github': personal_info.get('github', ''),
+            'portfolio': personal_info.get('portfolio', ''),
+            'summary': data.get('summary', ''),
+            'target_role': data.get('target_role', ''),
+            'target_category': data.get('target_category', ''),
+            'education': str(data.get('education', [])),
+            'experience': str(data.get('experience', [])),
+            'projects': str(data.get('projects', [])),
+            'skills': str(data.get('skills', [])),
+            'template': data.get('template', ''),
+            'created_at': datetime.utcnow()
+        }
+        result = db.resume_data.insert_one(document)
+        return str(result.inserted_id)
+    except Exception as e:
+        print(f"Error saving resume data: {str(e)}")
+        return None
+
+
+def save_analysis_data(resume_id, analysis):
+    """Save resume analysis data"""
+    db = get_database_connection()
+    try:
+        document = {
+            'resume_id': resume_id,
+            'ats_score': float(analysis.get('ats_score', 0)),
+            'keyword_match_score': float(analysis.get('keyword_match_score', 0)),
+            'format_score': float(analysis.get('format_score', 0)),
+            'section_score': float(analysis.get('section_score', 0)),
+            'missing_skills': analysis.get('missing_skills', ''),
+            'recommendations': analysis.get('recommendations', ''),
+            'created_at': datetime.utcnow()
+        }
+        db.resume_analysis.insert_one(document)
+    except Exception as e:
+        print(f"Error saving analysis data: {str(e)}")
+
+
+def get_resume_stats():
+    """Get statistics about resumes"""
+    db = get_database_connection()
+    try:
+        total_resumes = db.resume_data.count_documents({})
+        pipeline = [{"$group": {"_id": None, "avg_ats": {"$avg": "$ats_score"}}}]
+        result = list(db.resume_analysis.aggregate(pipeline))
+        avg_ats_score = round(result[0]['avg_ats'], 2) if result and result[0].get('avg_ats') else 0
+        recent = list(db.resume_data.find({}, {"name": 1, "target_role": 1, "created_at": 1}).sort("created_at", DESCENDING).limit(5))
+        recent_activity = [(r.get('name', ''), r.get('target_role', ''), str(r.get('created_at', ''))) for r in recent]
+        return {'total_resumes': total_resumes, 'avg_ats_score': avg_ats_score, 'recent_activity': recent_activity}
+    except Exception as e:
+        print(f"Error getting resume stats: {str(e)}")
+        return None
+
+
+def log_admin_action(admin_email, action):
+    """Log admin login/logout actions"""
+    db = get_database_connection()
+    try:
+        db.admin_logs.insert_one({'admin_email': admin_email, 'action': action, 'timestamp': datetime.utcnow()})
+    except Exception as e:
+        print(f"Error logging admin action: {str(e)}")
+
+
+def get_admin_logs():
+    """Get all admin login/logout logs"""
+    db = get_database_connection()
+    try:
+        logs = list(db.admin_logs.find({}, {"_id": 0}).sort("timestamp", DESCENDING))
+        return [(log['admin_email'], log['action'], str(log['timestamp'])) for log in logs]
+    except Exception as e:
+        print(f"Error getting admin logs: {str(e)}")
+        return []
+
+
+def get_all_resume_data():
+    """Get all resume data for admin dashboard"""
+    db = get_database_connection()
+    try:
+        resumes = list(db.resume_data.find().sort("created_at", DESCENDING))
+        result = []
+        for r in resumes:
+            rid = str(r['_id'])
+            a = db.resume_analysis.find_one({"resume_id": rid})
+            result.append((rid, r.get('name', ''), r.get('email', ''), r.get('phone', ''),
+                r.get('linkedin', ''), r.get('github', ''), r.get('portfolio', ''),
+                r.get('target_role', ''), r.get('target_category', ''), str(r.get('created_at', '')),
+                a.get('ats_score') if a else None, a.get('keyword_match_score') if a else None,
+                a.get('format_score') if a else None, a.get('section_score') if a else None))
+        return result
+    except Exception as e:
+        print(f"Error getting resume data: {str(e)}")
+        return []
+
+
+def verify_admin(email, password):
+    """Verify admin credentials"""
+    db = get_database_connection()
+    try:
+        result = db.admin.find_one({"email": email, "password": password})
+        return bool(result)
+    except Exception as e:
+        print(f"Error verifying admin: {str(e)}")
+        return False
+
+
+def add_admin(email, password):
+    """Add a new admin"""
+    db = get_database_connection()
+    try:
+        db.admin.insert_one({"email": email, "password": password, "created_at": datetime.utcnow()})
+        return True
+    except Exception as e:
+        print(f"Error adding admin: {str(e)}")
+        return False
+
+
+def save_ai_analysis_data(resume_id, analysis_data):
+    """Save AI analysis data to the database"""
+    db = get_database_connection()
+    try:
+        document = {
+            'resume_id': resume_id,
+            'model_used': analysis_data.get('model_used', ''),
+            'resume_score': analysis_data.get('resume_score', 0),
+            'job_role': analysis_data.get('job_role', ''),
+            'created_at': datetime.utcnow()
+        }
+        result = db.ai_analysis.insert_one(document)
+        return str(result.inserted_id)
+    except Exception as e:
+        print(f"Error saving AI analysis data: {e}")
+        raise
+
+
+def get_ai_analysis_stats():
+    """Get statistics about AI analyzer usage"""
+    db = get_database_connection()
+    try:
+        total = db.ai_analysis.count_documents({})
+        if total == 0:
+            return {"total_analyses": 0, "model_usage": [], "average_score": 0, "top_job_roles": []}
+
+        model_usage = [{"model": r['_id'], "count": r['count']}
+            for r in db.ai_analysis.aggregate([{"$group": {"_id": "$model_used", "count": {"$sum": 1}}}, {"$sort": {"count": -1}}])]
+
+        avg_result = list(db.ai_analysis.aggregate([{"$group": {"_id": None, "avg": {"$avg": "$resume_score"}}}]))
+        avg_score = round(avg_result[0]['avg'], 1) if avg_result and avg_result[0].get('avg') else 0
+
+        top_roles = [{"role": r['_id'], "count": r['count']}
+            for r in db.ai_analysis.aggregate([{"$group": {"_id": "$job_role", "count": {"$sum": 1}}}, {"$sort": {"count": -1}}, {"$limit": 5}])]
+
+        return {"total_analyses": total, "model_usage": model_usage, "average_score": avg_score, "top_job_roles": top_roles}
+    except Exception as e:
+        print(f"Error getting AI analysis stats: {e}")
+        return {"total_analyses": 0, "model_usage": [], "average_score": 0, "top_job_roles": []}
+
+
+def get_detailed_ai_analysis_stats():
+    """Get detailed statistics about AI analyzer usage including daily trends"""
+    db = get_database_connection()
+    empty = {"total_analyses": 0, "model_usage": [], "average_score": 0, "top_job_roles": [],
+             "daily_trend": [], "score_distribution": [], "recent_analyses": []}
+    try:
+        total = db.ai_analysis.count_documents({})
+        if total == 0:
+            return empty
+
+        model_usage = [{"model": r['_id'], "count": r['count']}
+            for r in db.ai_analysis.aggregate([{"$group": {"_id": "$model_used", "count": {"$sum": 1}}}, {"$sort": {"count": -1}}])]
+
+        avg_result = list(db.ai_analysis.aggregate([{"$group": {"_id": None, "avg": {"$avg": "$resume_score"}}}]))
+        avg_score = round(avg_result[0]['avg'], 1) if avg_result and avg_result[0].get('avg') else 0
+
+        top_roles = [{"role": r['_id'], "count": r['count']}
+            for r in db.ai_analysis.aggregate([{"$group": {"_id": "$job_role", "count": {"$sum": 1}}}, {"$sort": {"count": -1}}, {"$limit": 5}])]
+
+        seven_days_ago = datetime.utcnow() - timedelta(days=7)
+        daily_trend = [{"date": r['_id'], "count": r['count']}
+            for r in db.ai_analysis.aggregate([
+                {"$match": {"created_at": {"$gte": seven_days_ago}}},
+                {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}}, "count": {"$sum": 1}}},
+                {"$sort": {"_id": 1}}])]
+
+        score_distribution = []
+        for sr in [{"min": 0, "max": 20, "range": "0-20"}, {"min": 21, "max": 40, "range": "21-40"},
+                   {"min": 41, "max": 60, "range": "41-60"}, {"min": 61, "max": 80, "range": "61-80"},
+                   {"min": 81, "max": 100, "range": "81-100"}]:
+            count = db.ai_analysis.count_documents({"resume_score": {"$gte": sr["min"], "$lte": sr["max"]}})
+            score_distribution.append({"range": sr["range"], "count": count})
+
+        recent = list(db.ai_analysis.find({}, {"_id": 0, "model_used": 1, "resume_score": 1, "job_role": 1, "created_at": 1}).sort("created_at", DESCENDING).limit(5))
+        recent_analyses = [{"model": r.get('model_used', ''), "score": r.get('resume_score', 0),
+            "job_role": r.get('job_role', ''), "date": str(r.get('created_at', ''))} for r in recent]
+
+        return {"total_analyses": total, "model_usage": model_usage, "average_score": avg_score,
+                "top_job_roles": top_roles, "daily_trend": daily_trend,
+                "score_distribution": score_distribution, "recent_analyses": recent_analyses}
+    except Exception as e:
+        print(f"Error getting detailed AI analysis stats: {e}")
+        return empty
+
+
+def reset_ai_analysis_stats():
+    """Reset AI analysis statistics by deleting all documents"""
+    db = get_database_connection()
+    try:
+        total = db.ai_analysis.count_documents({})
+        if total == 0:
+            return {"success": False, "message": "AI analysis collection is already empty"}
+        db.ai_analysis.delete_many({})
+        return {"success": True, "message": "AI analysis statistics have been reset successfully"}
+    except Exception as e:
+        print(f"Error resetting AI analysis stats: {e}")
+        return {"success": False, "message": f"Error resetting AI analysis statistics: {str(e)}"}
+
+# --- User Management ---
+
+def get_all_users():
+    db = get_database_connection()
+    try:
+        users = list(db.users.find({}, {"password": 0}).sort("created_at", DESCENDING))
+        formatted_users = []
+        for u in users:
+            formatted_users.append({
+                "id": str(u.get("_id", "")),
+                "name": u.get("name", u.get("email", "").split("@")[0]),
+                "email": u.get("email", ""),
+                "status": u.get("status", "Active"),
+                "role": u.get("role", "User"),
+                "created_at": str(u.get("created_at", ""))
+            })
+        return formatted_users
+    except Exception as e:
+        print(f"Error getting users: {str(e)}")
+        return []
+
+def update_user_status(user_id, status):
+    db = get_database_connection()
+    try:
+        db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"status": status}})
+        return True
+    except Exception as e:
+        print(f"Error updating user status: {str(e)}")
+        return False
+
+def delete_user(user_id):
+    db = get_database_connection()
+    try:
+        db.users.delete_one({"_id": ObjectId(user_id)})
+        return True
+    except Exception as e:
+        print(f"Error deleting user: {str(e)}")
+        return False
+
+def _hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def create_user(name, email, password):
+    db = get_database_connection()
+    try:
+        # Check if user already exists
+        if db.users.find_one({"email": email}):
+            return False, "Email already registered"
+            
+        user_data = {
+            "name": name,
+            "email": email,
+            "password": _hash_password(password),
+            "status": "Active",
+            "role": "User",
+            "created_at": datetime.utcnow()
+        }
+        db.users.insert_one(user_data)
+        return True, "User registered successfully"
+    except Exception as e:
+        print(f"Error creating user: {str(e)}")
+        return False, f"Error: {str(e)}"
+
+def verify_user_login(email, password):
+    db = get_database_connection()
+    try:
+        user = db.users.find_one({
+            "email": email,
+            "password": _hash_password(password)
+        })
+        
+        if user:
+            if user.get("status") == "Blocked":
+                return False, "Account is blocked. Please contact support.", None
+            return True, "Login successful", user
+        return False, "Invalid email or password", None
+    except Exception as e:
+        print(f"Error verifying user: {str(e)}")
+        return False, f"Error: {str(e)}", None
+
+# --- Job Management ---
+
+def get_all_jobs():
+    db = get_database_connection()
+    try:
+        jobs = list(db.jobs.find().sort("created_at", DESCENDING))
+        for j in jobs:
+            j["_id"] = str(j["_id"])
+        return jobs
+    except Exception as e:
+        print(f"Error getting jobs: {str(e)}")
+        return []
+
+def add_job(job_data):
+    db = get_database_connection()
+    try:
+        job_data["created_at"] = datetime.utcnow()
+        if "status" not in job_data:
+            job_data["status"] = "Active"
+        result = db.jobs.insert_one(job_data)
+        return str(result.inserted_id)
+    except Exception as e:
+        print(f"Error adding job: {str(e)}")
+        return None
+
+def update_job(job_id, job_data):
+    db = get_database_connection()
+    try:
+        db.jobs.update_one({"_id": ObjectId(job_id)}, {"$set": job_data})
+        return True
+    except Exception as e:
+        print(f"Error updating job: {str(e)}")
+        return False
+
+def update_job_status(job_id, status):
+    return update_job(job_id, {"status": status})
+
+def delete_job(job_id):
+    db = get_database_connection()
+    try:
+        db.jobs.delete_one({"_id": ObjectId(job_id)})
+        return True
+    except Exception as e:
+        print(f"Error deleting job: {str(e)}")
+        return False
+
+# --- Template Management ---
+
+def get_all_templates():
+    db = get_database_connection()
+    try:
+        templates = list(db.templates.find().sort("created_at", DESCENDING))
+        for t in templates:
+            t["_id"] = str(t["_id"])
+        return templates
+    except Exception as e:
+        print(f"Error getting templates: {str(e)}")
+        return []
+
+def add_template(template_data):
+    db = get_database_connection()
+    try:
+        template_data["created_at"] = datetime.utcnow()
+        result = db.templates.insert_one(template_data)
+        return str(result.inserted_id)
+    except Exception as e:
+        print(f"Error adding template: {str(e)}")
+        return None
+
+def update_template(template_id, template_data):
+    db = get_database_connection()
+    try:
+        db.templates.update_one({"_id": ObjectId(template_id)}, {"$set": template_data})
+        return True
+    except Exception as e:
+        print(f"Error updating template: {str(e)}")
+        return False
+
+def delete_template(template_id):
+    db = get_database_connection()
+    try:
+        db.templates.delete_one({"_id": ObjectId(template_id)})
+        return True
+    except Exception as e:
+        print(f"Error deleting template: {str(e)}")
+        return False
